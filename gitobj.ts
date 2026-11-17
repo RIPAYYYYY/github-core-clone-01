@@ -527,18 +527,37 @@ export function selectFetchObjects(
   }
   for (const oid of shallowSet) hadCommits.add(oid);
 
-  // Commits to send: ancestors of the wants (within `deepen` generations when set), minus the had ones.
+  // Split the wants: commits are history-walked; a tag want carries the tag object itself and walks
+  // from the commit it peels to; a tree/blob want is carried whole.
+  const commitWants: string[] = [];
+  const extraRoots = new Set<string>();
+  for (const want of wants) {
+    const type = store.typeOf(want);
+    if (type === 'commit') commitWants.push(want);
+    else if (type === 'tag') {
+      extraRoots.add(want);
+      const target = peelToCommit(store, want);
+      if (store.typeOf(target) === 'commit') commitWants.push(target);
+    } else if (type !== undefined) {
+      extraRoots.add(want);
+    }
+  }
+
+  // Commits to send: ancestors of the commit wants, minus the had ones. The walk expands through a
+  // commit when the depth budget allows (deepen counts generations from the want, held or not); an
+  // undeepened fetch stops at held commits and at the client's shallow boundary.
   const sendCommits = new Set<string>();
   const depthOf = new Map<string, number>();
-  let frontier = wants.filter((oid) => store.typeOf(oid) === 'commit');
+  let frontier = [...new Set(commitWants)];
   for (const oid of frontier) depthOf.set(oid, 1);
   let depth = 1;
   while (frontier.length > 0) {
     const next: string[] = [];
     for (const oid of frontier) {
-      if (hadCommits.has(oid)) continue;
-      sendCommits.add(oid);
-      if (deepen !== null && depth >= deepen) continue;
+      const had = hadCommits.has(oid);
+      if (!had) sendCommits.add(oid);
+      const expand = deepen !== null ? depth < deepen : !had && !shallowSet.has(oid);
+      if (!expand) continue;
       for (const parent of parseCommitData(store.get(oid)?.data ?? Buffer.alloc(0)).parents) {
         if (!depthOf.has(parent)) {
           depthOf.set(parent, depth + 1);
@@ -565,11 +584,33 @@ export function selectFetchObjects(
     if (parents.every((parent) => sendCommits.has(parent) || hadCommits.has(parent))) unshallow.push(oid);
   }
 
-  // Objects: closure of the sent commits minus the closure of everything the client already has.
-  const hadObjects = objectClosure(store, [...hadCommits]);
-  const wanted = objectClosure(store, [...sendCommits]);
-  const rest: string[] = [];
-  for (const oid of wanted) if (!hadObjects.has(oid)) rest.push(oid);
+  // Objects: the sent commits with their tree closures (a commit contributes its tree and blobs, never
+  // its parents — history beyond the send set stays behind), plus the extra roots, minus what the
+  // client already has. The client's own set is built with the same no-history walk over its held
+  // commits: a shallow-held commit's ancestors are NOT part of what it has.
+  const walkNoHistory = (into: Set<string>, root: string): void => {
+    const stack = [root];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (into.has(oid)) continue;
+      const obj = store.get(oid);
+      if (obj === undefined) continue;
+      into.add(oid);
+      if (obj.type === 'tree') {
+        for (const entry of parseTreeData(obj.data)) stack.push(entry.oid);
+      } else if (obj.type === 'tag') {
+        stack.push(parseTagData(obj.data).target);
+      } else if (obj.type === 'commit') {
+        stack.push(parseCommitData(obj.data).tree);
+      }
+    }
+  };
+  const hadObjects = new Set<string>();
+  for (const oid of hadCommits) walkNoHistory(hadObjects, oid);
+  const sendObjects = new Set<string>();
+  for (const oid of sendCommits) walkNoHistory(sendObjects, oid);
+  for (const oid of extraRoots) walkNoHistory(sendObjects, oid);
+  const rest = [...sendObjects].filter((oid) => !hadObjects.has(oid));
   const commitsFirst = [...sendCommits].filter((oid) => rest.includes(oid));
   const others = rest.filter((oid) => !sendCommits.has(oid));
   return { objects: [...commitsFirst, ...others], shallow: newShallow, unshallow };

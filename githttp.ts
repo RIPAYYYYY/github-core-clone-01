@@ -164,11 +164,14 @@ function fetchV2(forge: Forge, repo: RepoRec, argLines: string[]): Buffer {
 function fetchV0(forge: Forge, repo: RepoRec, body: Buffer): Buffer {
   const first = readPktItems(body, 0);
   const args: FetchArgs = { wants: [], haves: [], shallow: [], deepen: null, done: false, noProgress: false };
+  // v0 lays the request out in two sections: wants with the shallow/deepen lines, then a flush, then
+  // the have lines and done. Scan both sections for every line kind.
   for (const line of pktTexts(first.items)) {
     if (line.startsWith('want ')) {
       const rest = line.slice(5).split('\0')[0] as string;
       args.wants.push(rest.trim().split(/\s+/)[0] as string);
-    }
+    } else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8).trim());
+    else if (line.startsWith('deepen ')) args.deepen = Number(line.slice(7).trim()) || null;
   }
   const second = readPktItems(body, first.next);
   for (const line of pktTexts(second.items)) {
