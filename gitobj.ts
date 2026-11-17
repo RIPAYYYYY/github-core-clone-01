@@ -28,6 +28,8 @@ export function hashObject(type: ObjType, data: Buffer): string {
 /** One content-addressed object store shared by every repository (objects are immutable and keyed by hash). */
 export class ObjectStore {
   readonly map = new Map<string, GitObject>();
+  /** Parsed-commit memo: commits are immutable, so a parse never goes stale. */
+  readonly commitInfoCache = new Map<string, CommitInfo>();
 
   put(type: ObjType, data: Buffer): string {
     const oid = hashObject(type, data);
@@ -181,6 +183,17 @@ export function parseTagData(data: Buffer): { target: string; targetType: string
   return { target, targetType };
 }
 
+/** A commit's parsed form, memoized on the store; null when the oid is not a commit here. */
+export function commitInfo(store: ObjectStore, oid: string): CommitInfo | null {
+  const cached = store.commitInfoCache.get(oid);
+  if (cached !== undefined) return cached;
+  const obj = store.get(oid);
+  if (obj === undefined || obj.type !== 'commit') return null;
+  const info = parseCommitData(obj.data);
+  if (store.commitInfoCache.size < 200_000) store.commitInfoCache.set(oid, info);
+  return info;
+}
+
 /** Follow tag objects until a non-tag object; returns that oid (or the input when not a tag). */
 export function peelToCommit(store: ObjectStore, oid: string): string {
   let current = oid;
@@ -203,9 +216,9 @@ export function ancestorGenerations(store: ObjectStore, tip: string): Map<string
   while (frontier.length > 0) {
     const next: Array<{ oid: string; gen: number }> = [];
     for (const { oid, gen } of frontier) {
-      const obj = store.get(oid);
-      if (obj === undefined || obj.type !== 'commit') continue;
-      for (const parent of parseCommitData(obj.data).parents) {
+      const info = commitInfo(store, oid);
+      if (info === null) continue;
+      for (const parent of info.parents) {
         if (!generations.has(parent)) {
           generations.set(parent, gen + 1);
           next.push({ oid: parent, gen: gen + 1 });
@@ -217,10 +230,27 @@ export function ancestorGenerations(store: ObjectStore, tip: string): Map<string
   return generations;
 }
 
-/** Whether `ancestor` is `descendant` itself or one of its ancestors. */
+/** Whether `ancestor` is `descendant` itself or one of its ancestors (breadth-first, early exit). */
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return ancestorGenerations(store, descendant).has(ancestor);
+  const seen = new Set<string>([descendant]);
+  let frontier = [descendant];
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const oid of frontier) {
+      const info = commitInfo(store, oid);
+      if (info === null) continue;
+      for (const parent of info.parents) {
+        if (parent === ancestor) return true;
+        if (!seen.has(parent)) {
+          seen.add(parent);
+          next.push(parent);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return false;
 }
 
 /** A best common ancestor of two commits (the one with the smallest combined generation), or null. */
@@ -253,7 +283,8 @@ export function objectClosure(store: ObjectStore, roots: string[]): Set<string> 
     if (obj === undefined) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const info = parseCommitData(obj.data);
+      const info = commitInfo(store, oid);
+      if (info === null) continue;
       stack.push(info.tree);
       for (const parent of info.parents) stack.push(parent);
     } else if (obj.type === 'tree') {
@@ -523,7 +554,7 @@ export function selectFetchObjects(
     if (store.typeOf(oid) !== 'commit') continue;
     hadCommits.add(oid);
     if (shallowSet.has(oid)) continue; // the shallow commit itself is had; its ancestors are not
-    for (const parent of parseCommitData(store.get(oid)?.data ?? Buffer.alloc(0)).parents) hadStack.push(parent);
+    for (const parent of commitInfo(store, oid)?.parents ?? []) hadStack.push(parent);
   }
   for (const oid of shallowSet) hadCommits.add(oid);
 
@@ -558,7 +589,7 @@ export function selectFetchObjects(
       if (!had) sendCommits.add(oid);
       const expand = deepen !== null ? depth < deepen : !had && !shallowSet.has(oid);
       if (!expand) continue;
-      for (const parent of parseCommitData(store.get(oid)?.data ?? Buffer.alloc(0)).parents) {
+      for (const parent of commitInfo(store, oid)?.parents ?? []) {
         if (!depthOf.has(parent)) {
           depthOf.set(parent, depth + 1);
           next.push(parent);
@@ -572,14 +603,14 @@ export function selectFetchObjects(
   // The new shallow boundary: sent commits with a parent that is neither sent nor had.
   const newShallow: string[] = [];
   for (const oid of sendCommits) {
-    const parents = parseCommitData(store.get(oid)?.data ?? Buffer.alloc(0)).parents;
+    const parents = commitInfo(store, oid)?.parents ?? [];
     const cut = parents.some((parent) => !sendCommits.has(parent) && !hadCommits.has(parent));
     if (cut && !shallowSet.has(oid)) newShallow.push(oid);
   }
   // Unshallow: client-shallow commits whose parents are all present after this fetch.
   const unshallow: string[] = [];
   for (const oid of shallowSet) {
-    const parents = parseCommitData(store.get(oid)?.data ?? Buffer.alloc(0)).parents;
+    const parents = commitInfo(store, oid)?.parents ?? [];
     if (parents.length === 0) continue;
     if (parents.every((parent) => sendCommits.has(parent) || hadCommits.has(parent))) unshallow.push(oid);
   }
@@ -601,7 +632,8 @@ export function selectFetchObjects(
       } else if (obj.type === 'tag') {
         stack.push(parseTagData(obj.data).target);
       } else if (obj.type === 'commit') {
-        stack.push(parseCommitData(obj.data).tree);
+        const info = commitInfo(store, oid);
+        if (info !== null) stack.push(info.tree);
       }
     }
   };
